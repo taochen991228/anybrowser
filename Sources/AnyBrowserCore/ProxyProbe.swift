@@ -45,19 +45,26 @@ public enum ProxyProbe {
         }
     }
 
-    /// The warning shown when a Profile starts with a proxy that does not accept connections, or
-    /// that refuses its user name and password; nil when neither is known or there is no proxy.
-    /// A proxy with credentials is tried through a `ProxyRelay`, as the browser reaches it: a
-    /// tunnel to the first lookup service is opened and closed again, so the proxy signs in.
-    public static func preflight(_ proxy: String, timeout: TimeInterval = 1.5) async -> String? {
-        guard let endpoint = try? ProxyEndpoint.parse(proxy) else { return nil }
-        guard await reachable(endpoint, timeout: timeout) else {
-            return "代理 \(endpoint.server) 无法连接，浏览器将无法联网。请确认代理已启动。"
+    /// The warning shown when a Profile starts with a proxy (or proxy chain) that does not accept
+    /// connections, or that refuses its user name and password; nil when neither is known or there
+    /// is no proxy. A proxy with credentials or a multi-hop chain is tried through a `ProxyRelay`,
+    /// as the browser reaches it: a tunnel to the first lookup service is opened and closed again.
+    public static func preflight(_ proxy: String, transitProxy: String = "", timeout: TimeInterval = 1.5) async -> String? {
+        let spec = ProxyChain.spec(proxy: proxy, transitProxy: transitProxy)
+        guard let chain = try? ProxyChain.parse(spec: spec) else { return nil }
+        guard await reachable(chain.first, timeout: timeout) else {
+            return chain.isChained
+                ? "前置中转代理 \(chain.first.server) 无法连接，浏览器将无法联网。请确认中转代理已启动。"
+                : "代理 \(chain.first.server) 无法连接，浏览器将无法联网。请确认代理已启动。"
         }
-        guard endpoint.needsRelay, let host = lookupServices.first?.host else { return nil }
-        switch await signInFailure(through: endpoint, target: "\(host):443", timeout: timeout) {
+        guard chain.needsRelay, let host = lookupServices.first?.host else { return nil }
+        switch await signInFailure(through: chain, target: "\(host):443", timeout: timeout) {
         case .credentialsRejected?, .credentialsRequired?:
-            return "代理 \(endpoint.server) 拒绝了用户名或密码，浏览器将无法联网。请检查代理地址里的账号密码。"
+            return "代理 \(chain.summary) 拒绝了用户名或密码，浏览器将无法联网。请检查代理地址里的账号密码。"
+        case .refused(let detail)? where chain.isChained:
+            return "链式代理 \(chain.summary) 建立隧道失败（\(detail)），浏览器将无法联网。请检查前置中转与出口代理。"
+        case .unreachable(let detail)? where chain.isChained:
+            return "链式代理 \(chain.summary) 无法连接（\(detail)），浏览器将无法联网。"
         default:
             // A slow or unreachable destination says nothing about the proxy itself.
             return nil
@@ -67,7 +74,12 @@ public enum ProxyProbe {
     /// How a CONNECT to `target` through a relay to `endpoint` failed, if it did within `timeout`.
     static func signInFailure(through endpoint: ProxyEndpoint, target: String,
                               timeout: TimeInterval) async -> ProxyRelay.Failure? {
-        guard let relay = try? ProxyRelay(upstream: endpoint, connectTimeout: timeout),
+        await signInFailure(through: ProxyChain(hops: [endpoint]), target: target, timeout: timeout)
+    }
+
+    static func signInFailure(through chain: ProxyChain, target: String,
+                              timeout: TimeInterval) async -> ProxyRelay.Failure? {
+        guard let relay = try? ProxyRelay(chain: chain.hops, connectTimeout: timeout),
               let port = try? await relay.start() else { return nil }
         defer { relay.stop() }
         guard let local = NWEndpoint.Port(rawValue: UInt16(port)) else { return nil }
@@ -97,35 +109,38 @@ public enum ProxyProbe {
         return relay.lastFailure
     }
 
-    /// Looks up the exit through `endpoint`, trying each service in turn. Without a proxy the request
-    /// uses the system network settings, as the browser does. A proxy with credentials, and an
-    /// HTTPS proxy, is reached through a `ProxyRelay` in this process, as the browser reaches the
-    /// first: URLSession's own proxy settings can neither sign in nor speak TLS to a proxy.
-    ///
-    /// With a `maxAge`, an exit found through the same proxy address within that many seconds is
-    /// returned without asking again, which spares the services' rate limits during a batch. A
-    /// rotating proxy changes its exit between connections, so callers keep the age short.
+    /// Looks up the exit through `endpoint`, trying each service in turn.
     public static func lookupExit(through endpoint: ProxyEndpoint?, services: [URL] = ProxyProbe.lookupServices,
                                   timeout: TimeInterval = 8, maxAge: TimeInterval = 0,
                                   configuration: URLSessionConfiguration = .ephemeral) async throws -> ProxyExit {
-        if maxAge > 0, let cached = cachedExit(for: endpoint, maxAge: maxAge) { return cached }
+        try await lookupExit(through: endpoint.map { ProxyChain(hops: [$0]) }, services: services,
+                             timeout: timeout, maxAge: maxAge, configuration: configuration)
+    }
+
+    /// Looks up the exit through `chain`, trying each service in turn. Without a proxy the request
+    /// uses the system network settings, as the browser does. Any multi-hop chain, a proxy with
+    /// credentials, or an HTTPS proxy is reached through a `ProxyRelay` in this process.
+    public static func lookupExit(through chain: ProxyChain?, services: [URL] = ProxyProbe.lookupServices,
+                                  timeout: TimeInterval = 8, maxAge: TimeInterval = 0,
+                                  configuration: URLSessionConfiguration = .ephemeral) async throws -> ProxyExit {
+        if maxAge > 0, let cached = cachedExit(for: chain, maxAge: maxAge) { return cached }
         var relay: ProxyRelay?
         let failures = RelayFailures()
-        if let endpoint, relays(endpoint) {
-            let started = try ProxyRelay(upstream: endpoint, connectTimeout: timeout)
+        if let chain, relays(chain) {
+            let started = try ProxyRelay(chain: chain.hops, connectTimeout: timeout)
             started.failureHandler = { failure, _ in failures.record(failure) }
             try await started.start()
             relay = started
         }
         defer { relay?.stop() }
-        let session = URLSession(configuration: try sessionConfiguration(configuration, through: endpoint,
+        let session = URLSession(configuration: try sessionConfiguration(configuration, through: chain,
                                                                          relayPort: relay?.port, timeout: timeout))
         defer { session.finishTasksAndInvalidate() }
         var reasons: [String] = []
         for service in services {
             do {
-                let exit = try await lookup(service, through: endpoint, in: session)
-                exitCache.store(exit, for: endpoint)
+                let exit = try await lookup(service, through: chain?.exit, in: session)
+                exitCache.store(exit, forKey: chain?.key ?? "")
                 return exit
             } catch let failure as LookupFailure {
                 // What the relay saw of the proxy says more than how URLSession failed.
@@ -140,7 +155,11 @@ public enum ProxyProbe {
     /// `maxAge` seconds old. Addresses are compared normalized, credentials included, since a
     /// provider can route each user name differently.
     public static func cachedExit(for endpoint: ProxyEndpoint?, maxAge: TimeInterval, now: Date = Date()) -> ProxyExit? {
-        exitCache.exit(for: endpoint, maxAge: maxAge, now: now)
+        cachedExit(for: endpoint.map { ProxyChain(hops: [$0]) }, maxAge: maxAge, now: now)
+    }
+
+    public static func cachedExit(for chain: ProxyChain?, maxAge: TimeInterval, now: Date = Date()) -> ProxyExit? {
+        exitCache.exit(forKey: chain?.key ?? "", maxAge: maxAge, now: now)
     }
 
     /// Forgets every cached exit, for instance after the network changed.
@@ -154,16 +173,16 @@ public enum ProxyProbe {
         private let lock = NSLock()
         private var exits: [String: (exit: ProxyExit, foundAt: Date)] = [:]
 
-        func store(_ exit: ProxyExit, for endpoint: ProxyEndpoint?, at date: Date = Date()) {
+        func store(_ exit: ProxyExit, forKey key: String, at date: Date = Date()) {
             lock.lock()
             defer { lock.unlock() }
-            exits[endpoint?.url ?? ""] = (exit, date)
+            exits[key] = (exit, date)
         }
 
-        func exit(for endpoint: ProxyEndpoint?, maxAge: TimeInterval, now: Date) -> ProxyExit? {
+        func exit(forKey key: String, maxAge: TimeInterval, now: Date) -> ProxyExit? {
             lock.lock()
             defer { lock.unlock() }
-            guard let entry = exits[endpoint?.url ?? ""], now.timeIntervalSince(entry.foundAt) <= maxAge,
+            guard let entry = exits[key], now.timeIntervalSince(entry.foundAt) <= maxAge,
                   entry.foundAt <= now else { return nil }
             return entry.exit
         }
@@ -178,6 +197,10 @@ public enum ProxyProbe {
     /// Whether lookups through `endpoint` go through a relay.
     static func relays(_ endpoint: ProxyEndpoint) -> Bool {
         endpoint.needsRelay || endpoint.scheme == "https"
+    }
+
+    static func relays(_ chain: ProxyChain) -> Bool {
+        chain.isChained || relays(chain.exit)
     }
 
     private static func reason(_ failure: ProxyRelay.Failure) -> String {
@@ -213,6 +236,12 @@ public enum ProxyProbe {
     /// `relayPort` is the relay's for an endpoint that `relays`.
     static func sessionConfiguration(_ base: URLSessionConfiguration, through endpoint: ProxyEndpoint?,
                                      relayPort: Int? = nil, timeout: TimeInterval) throws -> URLSessionConfiguration {
+        try sessionConfiguration(base, through: endpoint.map { ProxyChain(hops: [$0]) },
+                                 relayPort: relayPort, timeout: timeout)
+    }
+
+    static func sessionConfiguration(_ base: URLSessionConfiguration, through chain: ProxyChain?,
+                                     relayPort: Int? = nil, timeout: TimeInterval) throws -> URLSessionConfiguration {
         let configuration = base.copy() as? URLSessionConfiguration ?? .ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
@@ -221,8 +250,8 @@ public enum ProxyProbe {
         configuration.httpShouldSetCookies = false
         configuration.httpCookieStorage = nil
         configuration.urlCredentialStorage = nil
-        guard let endpoint else { return configuration }
-        if relays(endpoint) {
+        guard let chain else { return configuration }
+        if relays(chain) {
             guard let relayPort else { throw ProfileError.invalid("检测这个代理需要本机代理中继。") }
             configuration.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPEnable as String: 1,
@@ -234,6 +263,7 @@ public enum ProxyProbe {
             ]
             return configuration
         }
+        let endpoint = chain.exit
         let host = bare(endpoint.host)
         switch endpoint.scheme {
         case "socks5":

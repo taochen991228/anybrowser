@@ -38,7 +38,8 @@ func fail(_ code: Exit, _ message: String) -> Never {
 }
 
 struct Configuration: Decodable {
-    var upstream: String
+    var upstream: String?
+    var chain: [String]?
     var connectTimeout: TimeInterval?
     var relaunchGrace: TimeInterval?
 }
@@ -90,12 +91,26 @@ let configData = configPath == "-" ? readStandardInputLine(limit: limit) : readP
 guard configData.count <= limit, let configuration = try? JSONDecoder().decode(Configuration.self, from: configData) else {
     fail(.config, "配置无法识别，应为 {\"upstream\": \"代理地址\"}。")
 }
-let upstream: ProxyEndpoint
+let hops: [ProxyEndpoint]
 do {
-    guard let endpoint = try ProxyEndpoint.parse(configuration.upstream, allowingSOCKSCredentials: true) else {
+    if let rawChain = configuration.chain, !rawChain.isEmpty {
+        var parsed: [ProxyEndpoint] = []
+        for (index, item) in rawChain.enumerated() {
+            guard let endpoint = try ProxyEndpoint.parse(item, allowingSOCKSCredentials: true) else {
+                fail(.config, "代理链包含空地址。")
+            }
+            if index > 0, endpoint.scheme == "https" {
+                fail(.config, "链式代理的后续节点暂不支持 HTTPS 代理。")
+            }
+            parsed.append(endpoint)
+        }
+        hops = parsed
+    } else if let rawUpstream = configuration.upstream,
+              let endpoint = try ProxyEndpoint.parse(rawUpstream, allowingSOCKSCredentials: true) {
+        hops = [endpoint]
+    } else {
         fail(.config, "配置里没有上游代理地址。")
     }
-    upstream = endpoint
 } catch {
     fail(.config, error.localizedDescription)
 }
@@ -106,7 +121,7 @@ guard relaunchGrace.isFinite, (0...300).contains(relaunchGrace) else { fail(.con
 let followed = options["--follow"].map { URL(fileURLWithPath: $0, isDirectory: true) }
 let relay: ProxyRelay
 do {
-    relay = try ProxyRelay(upstream: upstream, connectTimeout: timeout)
+    relay = try ProxyRelay(chain: hops, connectTimeout: timeout)
 } catch {
     fail(.config, error.localizedDescription)
 }

@@ -12,7 +12,11 @@ struct RelayReceipt: Codable, Equatable {
     let upstream: String
 
     static func digest(_ endpoint: ProxyEndpoint) -> String {
-        SHA256.hash(data: Data(endpoint.url.utf8)).map { String(format: "%02x", $0) }.joined()
+        digest(ProxyChain(hops: [endpoint]))
+    }
+
+    static func digest(_ chain: ProxyChain) -> String {
+        SHA256.hash(data: Data(chain.key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -59,11 +63,13 @@ extension BrowserRuntime {
         directory.appendingPathComponent(RelayHelper.portFileName)
     }
 
-    /// Starts the Profile's relay to `upstream` and waits until it listens. Its output joins the
+    /// Starts the Profile's relay to `chain` and waits until it listens. Its output joins the
     /// browser's launch log. Fails without leaving a process behind.
-    func startRelay(to upstream: ProxyEndpoint, directory: URL, output: Pipe, log: LaunchLog) async throws -> RelayLaunch {
+    func startRelay(to chain: ProxyChain, directory: URL, output: Pipe, log: LaunchLog) async throws -> RelayLaunch {
         guard let executable = engine.relayExecutable else {
-            throw BrowserRuntimeError.message("此 AnyBrowser 缺少代理中继组件，无法使用带账号密码的代理。请重新安装 AnyBrowser，或去掉代理的账号密码。")
+            throw BrowserRuntimeError.message(chain.isChained
+                ? "此 AnyBrowser 缺少代理中继组件，无法使用链式代理。请重新安装 AnyBrowser，或清空前置中转代理。"
+                : "此 AnyBrowser 缺少代理中继组件，无法使用带账号密码的代理。请重新安装 AnyBrowser，或去掉代理的账号密码。")
         }
         let portFile = relayPortFile(directory)
         unlink(portFile.path)
@@ -88,8 +94,11 @@ extension BrowserRuntime {
         let writer = fcntl(input.fileHandleForWriting.fileDescriptor, F_DUPFD_CLOEXEC, 0)
         try? input.fileHandleForWriting.close()
         if writer >= 0 { _ = fcntl(writer, F_SETNOSIGPIPE, 1) }
-        let configuration: [String: Any] = ["upstream": upstream.url, "connectTimeout": 15,
+        var configuration: [String: Any] = ["upstream": chain.exit.url, "connectTimeout": 15,
                                             "relaunchGrace": relayRelaunchGrace]
+        if chain.isChained {
+            configuration["chain"] = chain.hops.map(\.url)
+        }
         let line = String(decoding: try JSONSerialization.data(withJSONObject: configuration), as: UTF8.self) + "\n"
         var receipt: RelayReceipt?
         if writer >= 0, RelayLaunch.write(line, to: writer) {
@@ -97,7 +106,7 @@ extension BrowserRuntime {
                 if let port = readPort(portFile), ProcessInspection.hasLoopbackDebugListener(pid: helper.processIdentifier, port: port),
                    let stamp = ProcessStamp.read(helper.processIdentifier) {
                     receipt = RelayReceipt(pid: helper.processIdentifier, stamp: stamp, port: port,
-                                           upstream: RelayReceipt.digest(upstream))
+                                           upstream: RelayReceipt.digest(chain))
                 }
                 return receipt != nil || !helper.isRunning
             }

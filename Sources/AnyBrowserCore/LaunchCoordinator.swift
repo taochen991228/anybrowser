@@ -56,8 +56,8 @@ public final class LaunchCoordinator: ObservableObject {
     // Tests replace these.
     var proxyPreflight: (String) async -> String? = { await ProxyProbe.preflight($0) }
     var exitLookup: (String) async -> ProxyExit? = { proxy in
-        guard let endpoint = try? ProxyEndpoint.parse(proxy) else { return nil }
-        return try? await ProxyProbe.lookupExit(through: endpoint)
+        guard let chain = try? ProxyChain.parse(spec: proxy) else { return nil }
+        return try? await ProxyProbe.lookupExit(through: chain)
     }
     /// How long after a browser exits it is still polled for, in case it relaunched itself.
     var relaunchWindow: TimeInterval = 30
@@ -141,7 +141,8 @@ public final class LaunchCoordinator: ObservableObject {
         var storedOptions = stored.launch
         startedOptions.startURLs = []
         storedOptions.startURLs = []
-        if launched.fingerprint != stored.fingerprint || launched.proxy != stored.proxy || startedOptions != storedOptions {
+        if launched.fingerprint != stored.fingerprint || launched.proxy != stored.proxy
+            || launched.transitProxy != stored.transitProxy || startedOptions != storedOptions {
             return true
         }
         // A different account takes effect on restart; clearing the account does not sign the extension
@@ -195,7 +196,7 @@ public final class LaunchCoordinator: ObservableObject {
         defer { launches.remove(id) }
         // Runs beside the launch and never holds it up.
         let exitReview = reviewExit(of: requested)
-        let proxyWarning = await (preflight ?? PreflightCache()).warning(for: requested.proxy, check: proxyPreflight)
+        let proxyWarning = await (preflight ?? PreflightCache()).warning(for: requested.proxySpec, check: proxyPreflight)
         if restarting {
             try await runtime.stop(id)
             forgetLaunch(id)

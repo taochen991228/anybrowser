@@ -122,6 +122,46 @@ struct ProxyTests {
         }
     }
 
+    @Test("Proxy chains validate, route through relay, and redact transit credentials")
+    func validatesAndRedactsProxyChains() throws {
+        let chain = try #require(try ProxyChain.parse(proxy: "socks5://exit:p2@1.2.3.4:1080",
+                                                      transitProxy: "http://hop1:p1@127.0.0.1:7890"))
+        #expect(chain.isChained && chain.needsRelay)
+        #expect(chain.first.server == "http://127.0.0.1:7890")
+        #expect(chain.exit.server == "socks5://1.2.3.4:1080")
+        #expect(chain.summary == "http://127.0.0.1:7890 → socks5://1.2.3.4:1080")
+        #expect(try ProxyChain.parse(spec: chain.key) == chain)
+
+        // Transit without an exit proxy is refused.
+        #expect(throws: ProfileError.self) {
+            try ProxyChain.parse(proxy: "", transitProxy: "127.0.0.1:7890")
+        }
+        // HTTPS as second hop is refused for now.
+        #expect(throws: ProfileError.self) {
+            try ProxyChain.parse(proxy: "https://exit.example:443", transitProxy: "127.0.0.1:7890")
+        }
+
+        // Chained profiles always route via local relay even without credentials.
+        let directory = URL(fileURLWithPath: "/tmp/proxy/chain")
+        let profile = try BrowserProfile(name: "Chain", port: 9222, fingerprint: FingerprintSettings(seed: 7),
+                                         proxy: "socks5://1.2.3.4:1080", transitProxy: "127.0.0.1:7890").validated()
+        let args = profile.launchArguments(userDataDirectory: directory, relayPort: 54321)
+        #expect(args.contains("--proxy-server=http://127.0.0.1:54321"))
+        #expect(args.contains("--webrtc-ip-handling-policy=disable_non_proxied_udp"))
+
+        // Password-free export strips credentials from both exit and transit proxies.
+        let secretProfile = BrowserProfile(name: "SecretChain", port: 9223, fingerprint: FingerprintSettings(seed: 8),
+                                           proxy: "socks5://u2:p2@1.2.3.4:1080", transitProxy: "http://u1:p1@127.0.0.1:7890")
+        let redacted = ProfileLibrary.withoutSecrets(secretProfile)
+        #expect(redacted.proxy == "socks5://1.2.3.4:1080")
+        #expect(redacted.transitProxy == "http://127.0.0.1:7890")
+
+        // Changing transitProxy changes ProfileExitRecord.key so cached exits never bleed across routes.
+        let singleKey = try #require(ProfileExitRecord.key(for: "socks5://1.2.3.4:1080"))
+        let chainedKey = try #require(ProfileExitRecord.key(for: profile.proxySpec))
+        #expect(singleKey != chainedKey)
+    }
+
     @Test("The sign-in extension of AnyBrowser 0.4 is deleted, and nothing else in its place")
     func removesTheLegacySignInExtension() throws {
         let storage = try scratchDirectory("proxy-legacy")

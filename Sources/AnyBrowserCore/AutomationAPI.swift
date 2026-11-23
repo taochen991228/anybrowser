@@ -648,16 +648,16 @@ extension AutomationHTTP {
     /// Applies the exit's locale to each new Profile, returning a warning per proxy it failed for.
     private static func alignLocales(_ profiles: inout [BrowserProfile], _ backend: AutomationBackend)
         async -> (exits: [UUID: ProxyExit], warnings: [String]) {
-        let found = await locales(for: profiles.map(\.proxy), backend)
+        let found = await locales(for: profiles.map(\.proxySpec), backend)
         var exits: [UUID: ProxyExit] = [:]
         var warnings: [String] = []
         for index in profiles.indices {
-            let proxy = profiles[index].proxy
+            let proxy = profiles[index].proxySpec
             guard let result = found[proxy] else { continue }
             if let hint = result.hint { profiles[index].fingerprint.apply(hint) }
             if let exit = result.exit { exits[profiles[index].id] = exit }
             if result.hint == nil {
-                let server = (try? ProxyEndpoint.parse(proxy)).flatMap { $0 }?.server ?? proxy
+                let server = (try? ProxyChain.parse(spec: proxy)).flatMap { $0 }?.summary ?? proxy
                 let warning = "代理 \(server) 的出口检测失败，语言和时区保持随机。"
                 if !warnings.contains(warning) { warnings.append(warning) }
             }
@@ -790,8 +790,12 @@ extension AutomationHTTP {
         }
         // A configuration read without secrets and sent back whole names the proxy without its
         // credentials; that keeps the saved address rather than signing out of the proxy.
-        if let proxy = patch["proxy"] as? String, proxy == ProfileLibrary.withoutSecrets(profile).proxy {
+        let redacted = ProfileLibrary.withoutSecrets(profile)
+        if let proxy = patch["proxy"] as? String, proxy == redacted.proxy {
             patch["proxy"] = nil
+        }
+        if let transit = patch["transitProxy"] as? String, transit == redacted.transitProxy {
+            patch["transitProxy"] = nil
         }
         var updated = try merged(patch, into: profile)
         updated.id = id

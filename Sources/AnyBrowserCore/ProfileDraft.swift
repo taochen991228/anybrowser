@@ -117,7 +117,7 @@ extension ProfileDraft {
             return profile.fingerprint == other.profile.fingerprint && seedText == other.seedText
                 && cpuText == other.cpuText && resetsSiteData == other.resetsSiteData
                 && profile.deviceIdentity == other.profile.deviceIdentity
-        case .proxy: return profile.proxy == other.profile.proxy
+        case .proxy: return profile.proxy == other.profile.proxy && profile.transitProxy == other.profile.transitProxy
         case .group: return profile.group == other.profile.group
         case .notes: return profile.notes == other.profile.notes
         case .passkeyBox: return profile.passkeyBox == other.profile.passkeyBox
@@ -137,7 +137,9 @@ extension ProfileDraft {
             seedText = other.seedText
             cpuText = other.cpuText
             resetsSiteData = other.resetsSiteData
-        case .proxy: profile.proxy = other.profile.proxy
+        case .proxy:
+            profile.proxy = other.profile.proxy
+            profile.transitProxy = other.profile.transitProxy
         case .group: profile.group = other.profile.group
         case .notes: profile.notes = other.profile.notes
         case .passkeyBox: profile.passkeyBox = other.profile.passkeyBox

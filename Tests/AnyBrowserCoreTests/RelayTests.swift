@@ -303,4 +303,82 @@ struct RelayTests {
         #expect(tunnel.text.contains("<title>origin page.test</title><p id=path>/tls</p>"), "\(tunnel.head) \(tunnel.text)")
         #expect(upstream.requests.last?.authorization == upstream.signIn)
     }
+
+    @Test("Multi-hop proxy chains tunnel through transit then exit with independent credentials")
+    func chainsHTTPAndSOCKSUpstreams() async throws {
+        let origins = try Origins()
+        defer { origins.stop() }
+        // Hop 2 (exit): SOCKS5 with its own credentials, routing to the real origins.
+        let exitSOCKS = try UpstreamSOCKSStub(username: "exit-u", password: "exit-p", route: origins.route)
+        defer { exitSOCKS.stop() }
+        // Hop 1 (transit): HTTP proxy with its own credentials, routing only to Hop 2.
+        let exitPort = exitSOCKS.port
+        let transitHTTP = try UpstreamHTTPStub(credentials: "hop1:secret1", route: { host in
+            host == "exit-hop.test:\(exitPort)" || host == "127.0.0.1:\(exitPort)" ? exitPort : nil
+        })
+        defer { transitHTTP.stop() }
+
+        let hop1 = try #require(try ProxyEndpoint.parse("http://hop1:secret1@127.0.0.1:\(transitHTTP.port)"))
+        let hop2 = try #require(try ProxyEndpoint.parse("socks5://exit-u:exit-p@exit-hop.test:\(exitPort)"))
+        let relay = try ProxyRelay(chain: [hop1, hop2], connectTimeout: 5)
+        let port = try await relay.start()
+        defer { relay.stop() }
+
+        let tunnel = try #require(await RelayClient.tunnel(port, to: "echo.test:7", payload: Data("chained".utf8)))
+        #expect(tunnel.status == 200)
+        #expect(tunnel.text == "echo:chained")
+        #expect(transitHTTP.requests.first?.method == "CONNECT")
+        #expect(transitHTTP.requests.first?.target == "exit-hop.test:\(exitPort)")
+        #expect(transitHTTP.requests.first?.authorization == transitHTTP.signIn)
+        #expect(exitSOCKS.requests.first?.username == "exit-u" && exitSOCKS.requests.first?.password == "exit-p")
+        #expect(exitSOCKS.requests.first?.host == "echo.test" && exitSOCKS.requests.first?.port == 7)
+
+        // Plain HTTP forward over the 2-hop chain works too.
+        let page = try #require(await RelayClient.exchange(port, "GET http://page.test/chain HTTP/1.1\r\nHost: page.test\r\n\r\n"))
+        #expect(page.status == 200)
+        #expect(page.text.contains("<p id=path>/chain</p>"))
+    }
+
+    @Test("SOCKS5 transit chaining into an HTTP exit proxy fails closed when exit is down or rejects auth")
+    func chainsSOCKSToHTTPAndFailsClosed() async throws {
+        let origins = try Origins()
+        defer { origins.stop() }
+        let exitHTTP = try UpstreamHTTPStub(credentials: "u2:p2", route: origins.route)
+        defer { exitHTTP.stop() }
+        let exitPort = exitHTTP.port
+        let transitSOCKS = try UpstreamSOCKSStub(username: "u1", password: "p1", route: { host in
+            host == "exit-http.test" ? exitPort : nil
+        })
+        defer { transitSOCKS.stop() }
+
+        let hop1 = try #require(try ProxyEndpoint.parse("socks5://u1:p1@127.0.0.1:\(transitSOCKS.port)"))
+        let hop2 = try #require(try ProxyEndpoint.parse("http://u2:p2@exit-http.test:\(exitPort)"))
+        let relay = try ProxyRelay(chain: [hop1, hop2], connectTimeout: 5)
+        let port = try await relay.start()
+        defer { relay.stop() }
+
+        let ok = try #require(await RelayClient.tunnel(port, to: "echo.test:7", payload: Data("ok".utf8)))
+        #expect(ok.status == 200 && ok.text == "echo:ok")
+        #expect(transitSOCKS.requests.first?.host == "exit-http.test" && transitSOCKS.requests.first?.port == exitPort)
+        #expect(exitHTTP.requests.first?.target == "echo.test:7")
+
+        // Wrong exit credentials fail closed with 407 instead of bypassing Hop 2.
+        let badHop2 = try #require(try ProxyEndpoint.parse("http://u2:wrong@exit-http.test:\(exitPort)"))
+        let badRelay = try ProxyRelay(chain: [hop1, badHop2], connectTimeout: 5)
+        let badPort = try await badRelay.start()
+        defer { badRelay.stop() }
+        #expect(await RelayClient.tunnel(badPort, to: "echo.test:7", payload: Data())?.status == 407)
+        #expect(badRelay.lastFailure == .credentialsRejected)
+
+        // Unreachable exit through working transit fails closed with 502 instead of falling back to transit/direct.
+        let deadHop2 = try #require(try ProxyEndpoint.parse("http://dead-exit.test:8080"))
+        let deadRelay = try ProxyRelay(chain: [hop1, deadHop2], connectTimeout: 5)
+        let deadPort = try await deadRelay.start()
+        defer { deadRelay.stop() }
+        #expect(await RelayClient.tunnel(deadPort, to: "echo.test:7", payload: Data())?.status == 502)
+        guard case .refused? = deadRelay.lastFailure else {
+            Issue.record("Expected refused when exit hop is unreachable, got \(String(describing: deadRelay.lastFailure))")
+            return
+        }
+    }
 }

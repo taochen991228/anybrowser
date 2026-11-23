@@ -230,8 +230,9 @@ public final class BrowserRuntime: ObservableObject {
         // goes to the proxy the Profile names now.
         var relayPort: Int?
         if let relay = receipt.relay {
-            guard ownsRelay(relay, directory: directory), let upstream = try? ProxyEndpoint.parse(profile.proxy),
-                  upstream.needsRelay, relay.upstream == RelayReceipt.digest(upstream) else { return false }
+            guard ownsRelay(relay, directory: directory),
+                  let chain = try? ProxyChain.parse(proxy: profile.proxy, transitProxy: profile.transitProxy),
+                  chain.needsRelay, relay.upstream == RelayReceipt.digest(chain) else { return false }
             relayPort = relay.port
         }
         return arguments.dropFirst().elementsEqual(launchArguments(profile, directory: directory, relayPort: relayPort))
@@ -298,9 +299,9 @@ public final class BrowserRuntime: ObservableObject {
             log.read(from: output.fileHandleForReading)
             // The relay has to listen before the browser starts, since its port goes into the arguments.
             var relay: RelayLaunch?
-            if let upstream = try ProxyEndpoint.parse(profile.proxy), upstream.needsRelay {
+            if let chain = try ProxyChain.parse(proxy: profile.proxy, transitProxy: profile.transitProxy), chain.needsRelay {
                 do {
-                    relay = try await startRelay(to: upstream, directory: directory, output: output, log: log)
+                    relay = try await startRelay(to: chain, directory: directory, output: output, log: log)
                 } catch {
                     output.fileHandleForReading.readabilityHandler = nil
                     throw error

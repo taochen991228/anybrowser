@@ -28,22 +28,23 @@ extension LaunchCoordinator {
 
     /// Starts reviewing the exit for a launch of `profile`; nil without a proxy.
     func reviewExit(of profile: BrowserProfile) -> ExitReview? {
-        guard let endpoint = try? ProxyEndpoint.parse(profile.proxy) else { return nil }
+        guard let chain = try? profile.proxyChain() else { return nil }
         let id = profile.id
+        let spec = profile.proxySpec
         let review = ExitReview()
-        if let record = proxyLibrary.lastExit(forProfile: id, proxy: profile.proxy), Date().timeIntervalSince(record.checkedAt) < exitReviewAge {
+        if let record = proxyLibrary.lastExit(forProfile: id, proxy: spec), Date().timeIntervalSince(record.checkedAt) < exitReviewAge {
             review.finish(exitWarnings(for: id, exit: record.exit))
             return review
         }
-        let key = endpoint.url
-        let lookup = exitLookups[key] ?? Task { [exitLookup] in await exitLookup(profile.proxy) }
+        let key = chain.key
+        let lookup = exitLookups[key] ?? Task { [exitLookup] in await exitLookup(spec) }
         exitLookups[key] = lookup
         Task {
             let exit = await lookup.value
             if self.exitLookups[key] == lookup { self.exitLookups[key] = nil }
             // A failed lookup says nothing about the exit.
             guard let exit else { return review.finish([]) }
-            try? self.proxyLibrary.recordExit(exit, forProfile: id, proxy: profile.proxy)
+            try? self.proxyLibrary.recordExit(exit, forProfile: id, proxy: spec)
             review.finish(self.exitWarnings(for: id, exit: exit))
         }
         return review

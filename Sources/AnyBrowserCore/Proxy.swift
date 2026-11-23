@@ -171,6 +171,80 @@ public struct ProxyEndpoint: Equatable, Sendable {
     }
 }
 
+/// One or more proxies traffic passes through in order: `hops.first` is dialed directly, each
+/// subsequent hop is tunnelled through the previous one, and `hops.last` is the exit.
+public struct ProxyChain: Equatable, Sendable {
+    public static let separator = " -> "
+
+    public var hops: [ProxyEndpoint]
+
+    public init(hops: [ProxyEndpoint]) {
+        self.hops = hops
+    }
+
+    public var first: ProxyEndpoint { hops[0] }
+    public var exit: ProxyEndpoint { hops[hops.count - 1] }
+    public var isChained: Bool { hops.count > 1 }
+
+    /// Any multi-hop chain, or a single proxy with credentials, goes through `ProxyRelay`.
+    public var needsRelay: Bool { isChained || exit.needsRelay }
+
+    /// Normalized address key for caching and receipts; identical to `exit.url` for a single proxy.
+    public var key: String { hops.map(\.url).joined(separator: Self.separator) }
+
+    /// Human-readable route without credentials.
+    public var summary: String { hops.map(\.server).joined(separator: " → ") }
+
+    /// Parses an exit proxy with an optional transit (first-hop) proxy.
+    public static func parse(proxy: String, transitProxy: String = "",
+                             allowingSOCKSCredentials: Bool = true) throws -> ProxyChain? {
+        let exitEndpoint = try ProxyEndpoint.parse(proxy, allowingSOCKSCredentials: allowingSOCKSCredentials)
+        let transitEndpoint = try ProxyEndpoint.parse(transitProxy, allowingSOCKSCredentials: allowingSOCKSCredentials)
+        guard let exitEndpoint else {
+            if transitEndpoint != nil {
+                throw ProfileError.invalid("填写前置中转代理时，必须同时填写代理地址。")
+            }
+            return nil
+        }
+        guard let transitEndpoint else { return ProxyChain(hops: [exitEndpoint]) }
+        guard exitEndpoint.scheme != "https" else {
+            throw ProfileError.invalid("链式代理的出口代理目前支持 HTTP 和 SOCKS5，暂不支持 HTTPS 代理作为第二跳。")
+        }
+        return ProxyChain(hops: [transitEndpoint, exitEndpoint])
+    }
+
+    /// Combines `proxy` and optional `transitProxy` into one lookup/cache string (`proxy` alone when
+    /// unchained, or `transitProxy -> proxy` when chained).
+    public static func spec(proxy: String, transitProxy: String = "") -> String {
+        let exitText = proxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        let transitText = transitProxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transitText.isEmpty else { return exitText }
+        return "\(transitText)\(separator)\(exitText)"
+    }
+
+    /// Parses either a single proxy address or a `hop1 -> hop2` chain specification.
+    public static func parse(spec text: String, allowingSOCKSCredentials: Bool = true) throws -> ProxyChain? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.contains(separator) else {
+            return try ProxyEndpoint.parse(trimmed, allowingSOCKSCredentials: allowingSOCKSCredentials)
+                .map { ProxyChain(hops: [$0]) }
+        }
+        let parts = trimmed.components(separatedBy: separator)
+        var hops: [ProxyEndpoint] = []
+        for (index, part) in parts.enumerated() {
+            guard let endpoint = try ProxyEndpoint.parse(part, allowingSOCKSCredentials: allowingSOCKSCredentials) else {
+                throw ProfileError.invalid("链式代理包含空的节点地址。")
+            }
+            if index > 0, endpoint.scheme == "https" {
+                throw ProfileError.invalid("链式代理的后续节点目前支持 HTTP 和 SOCKS5，暂不支持 HTTPS 代理作为后续跳。")
+            }
+            hops.append(endpoint)
+        }
+        return hops.isEmpty ? nil : ProxyChain(hops: hops)
+    }
+}
+
 /// Where a Profile's traffic leaves for the internet, as reported by an IP lookup service.
 public struct ProxyExit: Codable, Equatable, Sendable {
     public var ip: String

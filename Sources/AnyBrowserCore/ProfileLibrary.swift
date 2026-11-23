@@ -74,6 +74,7 @@ public enum ProfileLibrary {
         var value = profile
         // An address that does not parse cannot be shown to be free of credentials.
         value.proxy = (try? ProxyEndpoint.parse(profile.proxy))?.map(\.server) ?? ""
+        value.transitProxy = (try? ProxyEndpoint.parse(profile.transitProxy))?.map(\.server) ?? ""
         value.passkeyBox = nil
         return value
     }

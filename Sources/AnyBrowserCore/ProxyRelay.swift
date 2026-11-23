@@ -47,13 +47,16 @@ public final class ProxyRelay: @unchecked Sendable {
         }
     }
 
-    public let upstream: ProxyEndpoint
-    /// How long the upstream may take to open a tunnel or answer a forwarded request's headers.
+    /// Ordered proxy hops from first hop (dialed directly) to final exit proxy.
+    public let chain: [ProxyEndpoint]
+    /// The exit proxy (final hop in `chain`).
+    public var upstream: ProxyEndpoint { chain[chain.count - 1] }
+    /// How long the upstream chain may take to open a tunnel or answer a forwarded request's headers.
     public let connectTimeout: TimeInterval
     /// Called on a relay queue for every failed connection, with the destination it was for.
     public var failureHandler: (@Sendable (Failure, String) -> Void)?
 
-    /// Trust decisions for an HTTPS upstream; nil keeps the system's certificate checks.
+    /// Trust decisions for an HTTPS first-hop upstream; nil keeps the system's certificate checks.
     var verifyUpstream: (@Sendable (sec_trust_t) -> Bool)?
 
     private let lock = NSLock()
@@ -66,16 +69,30 @@ public final class ProxyRelay: @unchecked Sendable {
     static let maximumHead = 65_536
 
     /// `upstream` must be an http, https or socks5 proxy; credentials are optional.
-    public init(upstream: ProxyEndpoint, connectTimeout: TimeInterval = 15) throws {
-        guard ["http", "https", "socks5"].contains(upstream.scheme),
-              (1...65535).contains(upstream.port), !upstream.host.isEmpty else {
-            throw ProfileError.invalid("代理中继只支持 HTTP、HTTPS 和 SOCKS5 上游代理。")
+    public convenience init(upstream: ProxyEndpoint, connectTimeout: TimeInterval = 15) throws {
+        try self.init(chain: [upstream], connectTimeout: connectTimeout)
+    }
+
+    /// A single proxy or a multi-hop chain (`chain.first` is dialed directly; subsequent hops must
+    /// be http or socks5 and are tunnelled through the previous hop).
+    public init(chain: [ProxyEndpoint], connectTimeout: TimeInterval = 15) throws {
+        guard !chain.isEmpty else {
+            throw ProfileError.invalid("代理链不能为空。")
         }
-        if upstream.scheme == "socks5", upstream.username.map({ $0.utf8.count > 255 }) == true
-            || upstream.password.map({ $0.utf8.count > 255 }) == true {
-            throw ProfileError.invalid("SOCKS5 代理的用户名和密码各不能超过 255 字节。")
+        for (index, hop) in chain.enumerated() {
+            let allowed = index == 0 ? ["http", "https", "socks5"] : ["http", "socks5"]
+            guard allowed.contains(hop.scheme),
+                  (1...65535).contains(hop.port), !hop.host.isEmpty else {
+                throw ProfileError.invalid(index == 0
+                    ? "代理中继只支持 HTTP、HTTPS 和 SOCKS5 上游代理。"
+                    : "链式代理的后续节点目前只支持 HTTP 和 SOCKS5 代理。")
+            }
+            if hop.scheme == "socks5", hop.username.map({ $0.utf8.count > 255 }) == true
+                || hop.password.map({ $0.utf8.count > 255 }) == true {
+                throw ProfileError.invalid("SOCKS5 代理的用户名和密码各不能超过 255 字节。")
+            }
         }
-        self.upstream = upstream
+        self.chain = chain
         self.connectTimeout = connectTimeout
     }
 
@@ -324,7 +341,7 @@ private final class Session {
     // MARK: The upstream
 
     private func connectUpstream(for request: Request) {
-        let endpoint = relay.upstream
+        let endpoint = relay.chain[0]
         let tcp = NWProtocolTCP.Options()
         tcp.connectionTimeout = max(1, Int(relay.connectTimeout.rounded(.up)))
         var tls: NWProtocolTLS.Options?
@@ -352,7 +369,7 @@ private final class Session {
             switch state {
             case .ready where !opened:
                 opened = true
-                endpoint.scheme == "socks5" ? greetSOCKS(for: request) : sendHTTP(request)
+                handshake(hopIndex: 0, for: request)
             // A refused connection waits for the network to change; nothing will change for a proxy.
             case .waiting(let error) where !opened, .failed(let error) where !opened:
                 fail(.unreachable("\(endpoint.host):\(endpoint.port) \(error.localizedDescription)"))
@@ -364,12 +381,85 @@ private final class Session {
         connection.start(queue: queue)
     }
 
-    private var authorization: String? {
-        guard let username = relay.upstream.username else { return nil }
-        return "Proxy-Authorization: Basic " + Data("\(username):\(relay.upstream.password ?? "")".utf8).base64EncodedString()
+    private func authorization(for hop: ProxyEndpoint) -> String? {
+        guard let username = hop.username else { return nil }
+        return "Proxy-Authorization: Basic " + Data("\(username):\(hop.password ?? "")".utf8).base64EncodedString()
     }
 
-    private func sendHTTP(_ request: Request) {
+    /// Walks each hop in `relay.chain`: intermediate hops open a raw tunnel to the next hop, and
+    /// the final hop carries the browser's actual request. Any hop failing aborts the connection
+    /// without ever falling back to a direct or shorter path.
+    private func handshake(hopIndex: Int, for request: Request) {
+        let hop = relay.chain[hopIndex]
+        if hopIndex < relay.chain.count - 1 {
+            let next = relay.chain[hopIndex + 1]
+            let nextHost = next.host.hasPrefix("[") ? String(next.host.dropFirst().dropLast()) : next.host
+            let advance: () -> Void = { [self] in handshake(hopIndex: hopIndex + 1, for: request) }
+            if hop.scheme == "socks5" {
+                greetSOCKS(through: hop, targetHost: nextHost, targetPort: next.port, then: advance)
+            } else {
+                tunnelHTTP(through: hop, targetHost: nextHost, targetPort: next.port, then: advance)
+            }
+            return
+        }
+        if hop.scheme == "socks5" {
+            let (host, port): (String, Int)
+            switch request {
+            case let .connect(name, number, _), let .forward(name, number, _): (host, port) = (name, number)
+            }
+            greetSOCKS(through: hop, targetHost: host, targetPort: port) { [self] in
+                switch request {
+                case .connect:
+                    established(reply: true)
+                case .forward(_, _, let head):
+                    var bytes = Data((head.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+                    bytes.append(clientBuffer)
+                    clientBuffer = Data()
+                    sendUpstream(bytes)
+                    established(reply: false)
+                }
+            }
+        } else {
+            sendHTTP(request, through: hop)
+        }
+    }
+
+    /// Opens an HTTP CONNECT tunnel through an intermediate hop to the next proxy hop.
+    private func tunnelHTTP(through hop: ProxyEndpoint, targetHost: String, targetPort: Int,
+                            then complete: @escaping () -> Void) {
+        let authority = targetHost.contains(":") ? "[\(targetHost)]:\(targetPort)" : "\(targetHost):\(targetPort)"
+        var head = ["CONNECT \(authority) HTTP/1.1", "Host: \(authority)"]
+        if let auth = authorization(for: hop) { head.append(auth) }
+        let bytes = Data((head.joined(separator: "\r\n") + "\r\n\r\n").utf8)
+        upstream?.send(content: bytes, completion: .contentProcessed { [self] error in
+            guard active else { return }
+            guard error == nil else { return fail(.unreachable(error!.localizedDescription)) }
+            readIntermediateHTTPHead(for: hop, then: complete)
+        })
+    }
+
+    private func readIntermediateHTTPHead(for hop: ProxyEndpoint, then complete: @escaping () -> Void) {
+        if let end = upstreamBuffer.range(of: Self.headEnd) {
+            let head = String(decoding: upstreamBuffer[..<end.lowerBound], as: UTF8.self)
+            let status = head.split(separator: "\r\n", maxSplits: 1).first?.split(separator: " ")
+            guard let status, status.count >= 2, status[0].hasPrefix("HTTP/1."), let code = Int(status[1]) else {
+                return fail(.invalidResponse)
+            }
+            if code == 407 {
+                return fail(hop.hasCredentials ? .credentialsRejected : .credentialsRequired)
+            }
+            guard (200..<300).contains(code) else {
+                return fail(.refused("HTTP \(code)"))
+            }
+            upstreamBuffer = Data(upstreamBuffer[end.upperBound...])
+            complete()
+            return
+        }
+        guard upstreamBuffer.count <= ProxyRelay.maximumHead, !upstreamEnded else { return fail(.invalidResponse) }
+        receiveUpstream { [self] in readIntermediateHTTPHead(for: hop, then: complete) }
+    }
+
+    private func sendHTTP(_ request: Request, through hop: ProxyEndpoint) {
         var head: [String]
         switch request {
         case let .connect(host, port, headers):
@@ -379,7 +469,7 @@ private final class Session {
         case let .forward(_, _, forwarded):
             head = forwarded
         }
-        if let authorization { head.append(authorization) }
+        if let auth = authorization(for: hop) { head.append(auth) }
         var bytes = Data((head.joined(separator: "\r\n") + "\r\n\r\n").utf8)
         if case .forward = request {
             // The body, if any, follows the headers.
@@ -394,11 +484,11 @@ private final class Session {
                 timer?.cancel()
                 pump(from: client, to: upstream!, ended: clientEnded)
             }
-            readUpstreamHead(for: request)
+            readUpstreamHead(for: request, hop: hop)
         })
     }
 
-    private func readUpstreamHead(for request: Request) {
+    private func readUpstreamHead(for request: Request, hop: ProxyEndpoint) {
         if let end = upstreamBuffer.range(of: Self.headEnd) {
             let head = String(decoding: upstreamBuffer[..<end.lowerBound], as: UTF8.self)
             let status = head.split(separator: "\r\n", maxSplits: 1).first?.split(separator: " ")
@@ -406,7 +496,7 @@ private final class Session {
                 return fail(.invalidResponse)
             }
             if code == 407 {
-                return fail(relay.upstream.hasCredentials ? .credentialsRejected : .credentialsRequired)
+                return fail(hop.hasCredentials ? .credentialsRejected : .credentialsRequired)
             }
             switch request {
             case .connect where (200..<300).contains(code):
@@ -421,28 +511,29 @@ private final class Session {
             return
         }
         guard upstreamBuffer.count <= ProxyRelay.maximumHead, !upstreamEnded else { return fail(.invalidResponse) }
-        receiveUpstream { [self] in readUpstreamHead(for: request) }
+        receiveUpstream { [self] in readUpstreamHead(for: request, hop: hop) }
     }
 
-    /// RFC 1928, offering user name and password sign-in (RFC 1929) when the address has them.
-    private func greetSOCKS(for request: Request) {
-        let methods: [UInt8] = relay.upstream.hasCredentials ? [0x00, 0x02] : [0x00]
+    /// RFC 1928, offering user name and password sign-in (RFC 1929) when `hop` has them.
+    private func greetSOCKS(through hop: ProxyEndpoint, targetHost: String, targetPort: Int,
+                            then complete: @escaping () -> Void) {
+        let methods: [UInt8] = hop.hasCredentials ? [0x00, 0x02] : [0x00]
         sendUpstream(Data([0x05, UInt8(methods.count)] + methods))
         need(2) { [self] reply in
             guard reply[0] == 0x05 else { return fail(.invalidResponse) }
             switch reply[1] {
             case 0x00:
-                requestSOCKS(request)
-            case 0x02 where relay.upstream.hasCredentials:
-                let username = Array((relay.upstream.username ?? "").utf8)
-                let password = Array((relay.upstream.password ?? "").utf8)
+                requestSOCKS(host: targetHost, port: targetPort, then: complete)
+            case 0x02 where hop.hasCredentials:
+                let username = Array((hop.username ?? "").utf8)
+                let password = Array((hop.password ?? "").utf8)
                 sendUpstream(Data([0x01, UInt8(username.count)] + username + [UInt8(password.count)] + password))
                 need(2) { [self] status in
                     guard status[0] == 0x01 else { return fail(.invalidResponse) }
                     guard status[1] == 0x00 else { return fail(.credentialsRejected) }
-                    requestSOCKS(request)
+                    requestSOCKS(host: targetHost, port: targetPort, then: complete)
                 }
-            case 0xff where !relay.upstream.hasCredentials:
+            case 0xff where !hop.hasCredentials:
                 fail(.credentialsRequired)
             default:
                 fail(.refused("SOCKS5 代理要求不支持的登录方式"))
@@ -450,11 +541,7 @@ private final class Session {
         }
     }
 
-    private func requestSOCKS(_ request: Request) {
-        let (host, port): (String, Int)
-        switch request {
-        case let .connect(name, number, _), let .forward(name, number, _): (host, port) = (name, number)
-        }
+    private func requestSOCKS(host: String, port: Int, then complete: @escaping () -> Void) {
         // Names go to the proxy as names, so the proxy resolves them rather than this Mac.
         var address: [UInt8]
         var ipv4 = in_addr()
@@ -478,18 +565,7 @@ private final class Session {
             case 0x03: length = Int(reply[4]) + 2
             default: return fail(.invalidResponse)
             }
-            need(length) { [self] _ in
-                switch request {
-                case .connect:
-                    established(reply: true)
-                case .forward(_, _, let head):
-                    var bytes = Data((head.joined(separator: "\r\n") + "\r\n\r\n").utf8)
-                    bytes.append(clientBuffer)
-                    clientBuffer = Data()
-                    sendUpstream(bytes)
-                    established(reply: false)
-                }
-            }
+            need(length) { _ in complete() }
         }
     }
 

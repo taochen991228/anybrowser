@@ -163,6 +163,9 @@ public struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
     public var port: Int
     public var fingerprint: FingerprintSettings
     public var proxy: String
+    /// Optional first-hop transit proxy for proxy chaining (e.g. local Clash `127.0.0.1:7890`).
+    /// Empty means direct connection to `proxy`.
+    public var transitProxy: String
     /// Free-form group shown in the sidebar; empty means ungrouped.
     public var group: String
     public var notes: String
@@ -179,7 +182,8 @@ public struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
     public var deviceIdentity: String?
 
     public init(id: UUID = UUID(), name: String, port: Int, fingerprint: FingerprintSettings,
-                proxy: String = BrowserProfile.defaultProxy, group: String = "", notes: String = "",
+                proxy: String = BrowserProfile.defaultProxy, transitProxy: String = "",
+                group: String = "", notes: String = "",
                 passkeyBox: PasskeyBoxAccount? = nil, launch: LaunchOptions = LaunchOptions(),
                 tags: [String] = [], accountStatus: AccountStatus? = nil,
                 deviceIdentity: String? = nil) {
@@ -188,6 +192,7 @@ public struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
         self.port = port
         self.fingerprint = fingerprint
         self.proxy = proxy
+        self.transitProxy = transitProxy
         self.group = group
         self.notes = notes
         self.passkeyBox = passkeyBox
@@ -204,6 +209,7 @@ public struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
         port = try data.decode(Int.self, forKey: .port)
         fingerprint = try data.decode(FingerprintSettings.self, forKey: .fingerprint)
         proxy = try data.decodeIfPresent(String.self, forKey: .proxy) ?? Self.defaultProxy
+        transitProxy = try data.decodeIfPresent(String.self, forKey: .transitProxy) ?? ""
         group = try data.decodeIfPresent(String.self, forKey: .group) ?? ""
         notes = try data.decodeIfPresent(String.self, forKey: .notes) ?? ""
         passkeyBox = try data.decodeIfPresent(PasskeyBoxAccount.self, forKey: .passkeyBox)
@@ -212,6 +218,17 @@ public struct BrowserProfile: Identifiable, Codable, Equatable, Sendable {
         // A status written by a newer version reads as unset instead of hiding the Profile.
         accountStatus = (try? data.decodeIfPresent(AccountStatus.self, forKey: .accountStatus)) ?? nil
         deviceIdentity = try data.decodeIfPresent(String.self, forKey: .deviceIdentity)
+    }
+
+    /// Combined proxy route spec (`proxy` when unchained, or `transitProxy -> proxy` when chained).
+    public var proxySpec: String {
+        ProxyChain.spec(proxy: proxy, transitProxy: transitProxy)
+    }
+
+    /// Parsed proxy chain for this Profile, or nil when no proxy is configured.
+    public func proxyChain(allowingSOCKSCredentials: Bool = true) throws -> ProxyChain? {
+        try ProxyChain.parse(proxy: proxy, transitProxy: transitProxy,
+                             allowingSOCKSCredentials: allowingSOCKSCredentials)
     }
 }
 
@@ -293,7 +310,8 @@ extension BrowserProfile {
         }
         try result.fingerprint.validate()
         result.proxy = proxy.trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = try ProxyEndpoint.parse(result.proxy)
+        result.transitProxy = transitProxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try ProxyChain.parse(proxy: result.proxy, transitProxy: result.transitProxy)
         result.group = group.trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.group.count <= 40, result.group.unicodeScalars.count <= 320,
               !result.group.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
@@ -322,12 +340,12 @@ extension BrowserProfile {
             // The window's name in the Window and Dock menus, in place of the page title.
             "--window-name=\(name)",
         ]
-        if let endpoint = try? ProxyEndpoint.parse(proxy) {
+        if let chain = try? ProxyChain.parse(proxy: proxy, transitProxy: transitProxy) {
             // The relay looks like a proxy without sign-in, and keeps host names for the upstream to resolve.
-            if endpoint.needsRelay, let relayPort {
+            if chain.needsRelay, let relayPort {
                 arguments.append("--proxy-server=http://127.0.0.1:\(relayPort)")
             } else {
-                arguments.append("--proxy-server=\(endpoint.server)")
+                arguments.append("--proxy-server=\(chain.exit.server)")
             }
             // A proxied Profile must not leak its real address through non-proxied UDP.
             arguments.append("--webrtc-ip-handling-policy=disable_non_proxied_udp")

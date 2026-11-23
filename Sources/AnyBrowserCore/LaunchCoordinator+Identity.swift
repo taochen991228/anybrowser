@@ -14,7 +14,7 @@ extension LaunchCoordinator {
         guard !isBusy(id) else { throw ProfileError.invalid("「\(profile.name)」正在执行另一个操作。") }
         regenerating.insert(id)
         defer { regenerating.remove(id) }
-        let proxy = profile.proxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proxy = profile.proxySpec
         var locale: IdentitySampler.LocaleHint?
         var lookupFailed = false
         if proxy.isEmpty {

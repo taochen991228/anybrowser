@@ -7,7 +7,7 @@ struct ProxyCard: View {
     @ObservedObject var workbench: Workbench
 
     private var center: ProxyCenter { workbench.proxyCenter }
-    private var check: ProxyCenter.Check? { center.check(for: draft.profile.id, proxy: draft.profile.proxy) }
+    private var check: ProxyCenter.Check? { center.check(for: draft.profile.id, proxy: draft.profile.proxySpec) }
     private var proxyLibrary: ProxyLibrary? { workbench.coordinator?.proxyLibrary }
 
     var body: some View {
@@ -15,7 +15,9 @@ struct ProxyCard: View {
             CardHeading(title: "代理", icon: "network")
             EditorInput("代理地址", placeholder: "留空使用系统网络设置",
                         value: $draft.profile.proxy, identifier: "profile-proxy")
-            Text("主机:端口默认为 HTTP，也可指定 HTTPS 或 SOCKS5。三种代理都可以带账号密码，写成 socks5://用户名:密码@主机:端口，或代理商常用的 主机:端口:用户名:密码。带账号密码的代理经本机中继连接，普通窗口、无痕窗口和自动化新建的上下文都经过它。保存并重启后生效。")
+            EditorInput("前置中转代理（可选，链式代理）", placeholder: "留空直连目标代理；例如 127.0.0.1:7890",
+                        value: $draft.profile.transitProxy, identifier: "profile-transit-proxy")
+            Text(transitHint)
                 .font(.system(size: 12))
                 .foregroundColor(WorkbenchPalette.muted)
                 .fixedSize(horizontal: false, vertical: true)
@@ -36,13 +38,21 @@ struct ProxyCard: View {
                 .buttonStyle(WorkbenchButtonStyle(.quiet))
                 .accessibilityIdentifier("fill-from-exit")
                 Spacer(minLength: 0)
+                transitLibraryMenu
                 libraryMenu
             }
             .disabled(check == .checking)
             result
             sharedExit
         }
-        .onChange(of: draft.profile.proxy) { center.proxyChanged(draft.profile.id, to: $0) }
+        .onChange(of: draft.profile.proxySpec) { center.proxyChanged(draft.profile.id, to: $0) }
+    }
+
+    private var transitHint: String {
+        if let chain = try? draft.profile.proxyChain(), chain.isChained {
+            return "链式代理：本机 → \(chain.first.server) → \(chain.exit.server) → 网站。所有流量经本机中继逐跳转发，任意一跳断开立即熔断，绝不回退直连。保存并重启后生效。"
+        }
+        return "主机:端口默认为 HTTP，也可指定 HTTPS 或 SOCKS5，支持账号密码和 主机:端口:用户名:密码。若填写前置中转代理，浏览器流量会先经前置代理再跳转至出口代理（出口代理支持 HTTP / SOCKS5），任意一跳断开即熔断。保存并重启后生效。"
     }
 
     @ViewBuilder private var result: some View {
@@ -91,18 +101,40 @@ struct ProxyCard: View {
     /// The exit recorded for the saved Profile, by a launch or an earlier check, while the draft
     /// keeps the saved proxy.
     private var recordedExit: (exit: ProxyExit, checkedAt: Date)? {
-        guard let saved = workbench.saved, Workbench.sameProxy(saved.proxy, draft.profile.proxy) else { return nil }
+        guard let saved = workbench.saved, Workbench.sameProxy(saved.proxySpec, draft.profile.proxySpec) else { return nil }
         return workbench.coordinator?.lastExit(for: draft.profile.id)
     }
 
     @ViewBuilder private var sharedExit: some View {
         let names = workbench.consistencyContext(for: draft.profile.id).profilesSharingExit
-        if !names.isEmpty, workbench.saved.map({ Workbench.sameProxy($0.proxy, draft.profile.proxy) }) == true {
+        if !names.isEmpty, workbench.saved.map({ Workbench.sameProxy($0.proxySpec, draft.profile.proxySpec) }) == true {
             Label(ConsistencyIssue.sharedExit(names) + "。", systemImage: "exclamationmark.triangle")
                 .font(.system(size: 12))
                 .foregroundColor(WorkbenchPalette.amber)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("proxy-shared-exit")
+        }
+    }
+
+    /// Proxies from the library for the transit hop; picking one fills in `transitProxy`.
+    @ViewBuilder private var transitLibraryMenu: some View {
+        let entries = proxyLibrary?.entries ?? []
+        if !entries.isEmpty {
+            Menu {
+                if !draft.profile.transitProxy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("清空前置中转代理") { draft.profile.transitProxy = "" }
+                    Divider()
+                }
+                ForEach(entries) { entry in
+                    Button(Self.title(entry)) { draft.profile.transitProxy = entry.url }
+                }
+            } label: {
+                Label("中转", systemImage: "arrow.triangle.branch")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("从代理库选择前置中转代理")
+            .accessibilityIdentifier("transit-proxy-from-library")
         }
     }
 
@@ -158,9 +190,12 @@ struct ProxyCard: View {
     private func checkAndRecord(_ profile: BrowserProfile) async -> ProxyExit? {
         let exit = await center.check(profile)
         if let exit, let saved = workbench.profiles.first(where: { $0.id == profile.id }),
-           Workbench.sameProxy(saved.proxy, profile.proxy) {
+           Workbench.sameProxy(saved.proxySpec, profile.proxySpec) {
             try? proxyLibrary?.recordExit(exit, forProfile: profile.id)
-            if let entry = proxyLibrary?.entry(matching: profile.proxy) { try? proxyLibrary?.recordCheck(entry.id, exit: exit) }
+            if saved.transitProxy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let entry = proxyLibrary?.entry(matching: profile.proxy) {
+                try? proxyLibrary?.recordCheck(entry.id, exit: exit)
+            }
         }
         return exit
     }
@@ -175,7 +210,8 @@ struct ProxyCard: View {
             found = await checkAndRecord(profile)
         }
         // A failed lookup is shown under the buttons; the editor may also have moved on meanwhile.
-        guard let exit = found, draft.profile.id == profile.id, draft.profile.proxy == profile.proxy else { return }
+        guard let exit = found, draft.profile.id == profile.id,
+              draft.profile.proxySpec == profile.proxySpec else { return }
         guard !exit.timeZone.isEmpty || !exit.languages.isEmpty else {
             workbench.notice = .init(text: "出口信息里没有时区和语言，请手动填写。", isError: true)
             return

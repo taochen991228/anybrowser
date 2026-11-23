@@ -85,7 +85,7 @@ public final class LibraryIndex {
     public static func currentExits(_ exits: [UUID: ProfileExitRecord], of profiles: [BrowserProfile]) -> [UUID: ProfileExitRecord] {
         var current: [UUID: ProfileExitRecord] = [:]
         for profile in profiles {
-            if let record = exits[profile.id], record.applies(to: profile.proxy) { current[profile.id] = record }
+            if let record = exits[profile.id], record.applies(to: profile.proxySpec) { current[profile.id] = record }
         }
         return current
     }

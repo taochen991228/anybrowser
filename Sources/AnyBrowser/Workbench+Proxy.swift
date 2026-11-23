@@ -34,27 +34,27 @@ final class ProxyCenter: ObservableObject {
     /// Looks up an exit without recording it against a Profile, for a Profile being created.
     func lookup(_ proxy: String) async -> ProxyExit? {
         let proxy = Self.normalized(proxy)
-        guard !proxy.isEmpty, let endpoint = try? ProxyEndpoint.parse(proxy) else { return nil }
-        return try? await ProxyProbe.lookupExit(through: endpoint)
+        guard !proxy.isEmpty, let chain = try? ProxyChain.parse(spec: proxy) else { return nil }
+        return try? await ProxyProbe.lookupExit(through: chain)
     }
 
-    /// Looks up where the Profile's traffic leaves, through the proxy it is given (saved or not).
+    /// Looks up where the Profile's traffic leaves, through the proxy (or chain) it is given (saved or not).
     @discardableResult
     func check(_ profile: BrowserProfile) async -> ProxyExit? {
-        let proxy = Self.normalized(profile.proxy)
+        let spec = Self.normalized(profile.proxySpec)
         let id = profile.id
         guard checks[id]?.check != .checking else { return nil }
-        checks[id] = (proxy, .checking)
+        checks[id] = (spec, .checking)
         let result: Check
         do {
-            let endpoint = try ProxyEndpoint.parse(proxy)
-            result = .succeeded(try await ProxyProbe.lookupExit(through: endpoint))
+            let chain = try profile.proxyChain()
+            result = .succeeded(try await ProxyProbe.lookupExit(through: chain))
         } catch {
             result = .failed(error.localizedDescription)
         }
         // A newer address replaced this one while the lookup ran.
-        guard checks[id]?.proxy == proxy else { return nil }
-        checks[id] = (proxy, result)
+        guard checks[id]?.proxy == spec else { return nil }
+        checks[id] = (spec, result)
         if case .succeeded(let exit) = result { return exit }
         return nil
     }

@@ -50,11 +50,11 @@ public struct ProfileExitRecord: Equatable, Sendable {
         self.proxy != nil && self.proxy == Self.key(for: proxy)
     }
 
-    /// What a record keeps of a proxy address: the SHA-256 of the normalized address, credentials
-    /// included since providers pick the exit by user name, without storing the password again. An
-    /// empty address (no proxy) has a key too; nil for one that does not parse.
+    /// What a record keeps of a proxy address (or chain spec): the SHA-256 of the normalized
+    /// address, credentials included since providers pick the exit by user name, without storing
+    /// the password again. An empty address (no proxy) has a key too; nil for one that does not parse.
     public static func key(for proxy: String) -> String? {
-        guard let address = try? ProxyEndpoint.parse(proxy, allowingSOCKSCredentials: true)?.url ?? "" else { return nil }
+        guard let address = try? ProxyChain.parse(spec: proxy, allowingSOCKSCredentials: true)?.key ?? "" else { return nil }
         return SHA256.hash(data: Data(address.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
@@ -234,9 +234,9 @@ public final class ProxyLibrary: ObservableObject {
         profileExits[id] = ProfileExitRecord(exit: exit, checkedAt: Self.stored(date), proxy: key)
     }
 
-    /// The proxy address of a Profile of the store, in the recycle bin or not.
+    /// The proxy address (or chain spec) of a Profile of the store, in the recycle bin or not.
     private func currentProxy(of id: UUID) -> String? {
-        (store.profiles.first { $0.id == id } ?? store.trashed.first { $0.id == id }?.profile)?.proxy
+        (store.profiles.first { $0.id == id } ?? store.trashed.first { $0.id == id }?.profile)?.proxySpec
     }
 
     /// Drops what is known about a Profile's exit, for instance once the Profile is gone.
@@ -252,7 +252,7 @@ public final class ProxyLibrary: ObservableObject {
         guard let ip = lastExit(forProfile: id)?.exit.ip else { return [] }
         return store.profiles.filter { profile in
             guard profile.id != id, let record = profileExits[profile.id], record.exit.ip == ip else { return false }
-            return record.applies(to: profile.proxy)
+            return record.applies(to: profile.proxySpec)
         }.map(\.id)
     }
 

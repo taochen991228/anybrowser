@@ -593,9 +593,9 @@ final class Workbench: ObservableObject {
     /// Profile while the draft keeps its proxy.
     func knownExit(for draft: ProfileDraft) -> ProxyExit? {
         let profile = draft.profile
-        if let exit = proxyCenter.exit(for: profile.id, proxy: profile.proxy) { return exit }
+        if let exit = proxyCenter.exit(for: profile.id, proxy: profile.proxySpec) { return exit }
         guard let saved = profiles.first(where: { $0.id == profile.id }),
-              Self.sameProxy(saved.proxy, profile.proxy) else { return nil }
+              Self.sameProxy(saved.proxySpec, profile.proxySpec) else { return nil }
         return coordinator?.lastExit(for: profile.id)?.exit
     }
 
